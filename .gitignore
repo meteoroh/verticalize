@@ -1,0 +1,38 @@
+# macOS
+.DS_Store
+
+# Xcode — build products & derived data
+build/
+DerivedData/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Xcode — per-user state, not project configuration
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.perspectivev3
+*.pbxuser
+*.mode1v3
+*.mode2v3
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+
+# CocoaPods / Carthage, if they ever show up
+Pods/
+Carthage/Build/
+
+# Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# Claude Code local settings
+**/.claude/settings.local.json
