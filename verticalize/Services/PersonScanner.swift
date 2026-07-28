@@ -2,9 +2,10 @@
 //  PersonScanner.swift
 //  verticalize
 //
-//  Walks the clip once, detects every human in the sampled frames, and groups
-//  those detections into distinct people using motion continuity first and
-//  Vision feature prints as the re-identification fallback.
+//  Walks the clip once, detects every human in the sampled frames, and hands
+//  those detections to `IdentityTracker` to be grouped into distinct people.
+//  This file owns the video and Vision plumbing; the matching decisions — the
+//  part that has to survive two people crossing — live in the tracker.
 //
 
 import AVFoundation
@@ -24,15 +25,14 @@ nonisolated struct PersonScanner {
         var minConfidence: Float = 0.35
         /// Boxes smaller than this fraction of the frame height are noise.
         var minBoxHeight: Double = 0.06
-        /// A cluster can be extended by motion alone for this long.
-        var motionGap: Double = 0.8
-        var motionIoU: Double = 0.32
-        /// Feature-print distance below which two crops are the same person.
-        var reidDistance: Double = 0.62
-        /// Looser threshold used when merging clusters that never co-occur.
+        /// Looser threshold used when merging tracks that never co-occur.
         var mergeDistance: Double = 0.55
-        /// Clusters seen fewer times than this are discarded.
+        /// Tracks seen fewer times than this are discarded.
         var minSightings: Int = 3
+        /// Keep an appearance model this big for each track, so re-acquisition
+        /// after an occlusion has several angles to compare against.
+        var descriptorTarget: Int = 3
+        var tracking: IdentityTracker.Options = .default
     }
 
     struct Progress: Sendable {
@@ -53,28 +53,45 @@ nonisolated struct PersonScanner {
         }
     }
 
-    // MARK: - Internal clustering state
-
-    private final class Cluster {
-        let id = UUID()
-        var sightings: [Sighting] = []
-        var prints: [FeaturePrintObservation] = []
-        var thumbnail: CGImage?
-        var thumbnailScore: Double = -.greatestFiniteMagnitude
-        var lastTime: Double = -.greatestFiniteMagnitude
-        var lastBox: CGRect = .zero
-        /// Sample times this cluster was seen at, for the co-occurrence check.
-        var times: Set<Int> = []
-    }
-
-    /// One human found in one frame, plus the lazily-computed feature print.
+    /// One human found in one frame.
     private struct Detection {
         var box: CGRect          // normalized, top-left origin
         var ciRect: CGRect       // pixel rect in CIImage space (bottom-left origin)
         var cgRect: CGRect       // pixel rect in CGImage space (top-left origin)
         var confidence: Float
-        var print: FeaturePrintObservation?
-        var printAttempted = false
+    }
+
+    /// Feature prints live here rather than inside the tracker, so the tracker
+    /// stays free of Vision and can be tested with synthetic descriptors.
+    /// Entries not referenced by a track are dropped after every frame.
+    private final class DescriptorTable {
+        private var prints: [Int: FeaturePrintObservation] = [:]
+        private var nextID = 0
+
+        func add(_ print: FeaturePrintObservation) -> Int {
+            defer { nextID += 1 }
+            prints[nextID] = print
+            return nextID
+        }
+
+        func distance(_ a: Int, _ b: Int) -> Double? {
+            guard let lhs = prints[a], let rhs = prints[b] else { return nil }
+            return try? lhs.distance(to: rhs)
+        }
+
+        func retain(_ ids: Set<Int>) {
+            prints = prints.filter { ids.contains($0.key) }
+        }
+    }
+
+    /// A track plus the scan-time extras the tracker doesn't care about.
+    private struct Candidate {
+        var id: UUID
+        var sightings: [Sighting]
+        var descriptors: [Int]
+        var sampleIndices: Set<Int>
+        var thumbnail: CGImage?
+        var thumbnailScore: Double
     }
 
     // MARK: - Entry point
@@ -114,7 +131,11 @@ nonisolated struct PersonScanner {
         let printRequest = GenerateImageFeaturePrintRequest()
         let ciContext = CIContext(options: [.cacheIntermediates: false])
 
-        var clusters: [Cluster] = []
+        let table = DescriptorTable()
+        let tracker = IdentityTracker(options: options.tracking) { [table] a, b in
+            table.distance(a, b)
+        }
+        var thumbnails: [UUID: (image: CGImage, score: Double)] = [:]
         var processed = 0
         var decodedAny = false
 
@@ -130,7 +151,7 @@ nonisolated struct PersonScanner {
             let ciImage = CIImage(cgImage: cgImage)
 
             let humans = (try? await humanRequest.perform(on: cgImage)) ?? []
-            var detections = humans.compactMap { human -> Detection? in
+            let detections = humans.compactMap { human -> Detection? in
                 guard human.confidence >= options.minConfidence else { return nil }
                 let normalized = human.boundingBox.cgRect
                 guard normalized.height >= options.minBoxHeight else { return nil }
@@ -150,87 +171,55 @@ nonisolated struct PersonScanner {
                 )
             }
 
-            // Pass 1 — extend existing tracks by motion continuity.
-            var claimedCluster = Set<Int>()
-            var claimedDetection = Set<Int>()
-            var motionPairs: [(cost: Double, cluster: Int, detection: Int)] = []
-            for (ci, cluster) in clusters.enumerated() {
-                guard time - cluster.lastTime <= options.motionGap else { continue }
-                for (di, detection) in detections.enumerated() {
-                    let overlap = iou(cluster.lastBox, detection.box)
-                    if overlap >= options.motionIoU {
-                        motionPairs.append((1 - overlap, ci, di))
-                    }
-                }
-            }
-            assign(motionPairs, &claimedCluster, &claimedDetection) { ci, di in
-                record(detections[di], at: time, index: sampleIndex, into: clusters[ci])
+            var observations = detections.map {
+                IdentityTracker.Observation(box: $0.box, confidence: $0.confidence)
             }
 
-            // Pass 2 — re-identify anyone who left and came back.
-            if claimedDetection.count < detections.count {
-                var reidPairs: [(cost: Double, cluster: Int, detection: Int)] = []
-                for di in detections.indices where !claimedDetection.contains(di) {
-                    await ensurePrint(
-                        &detections[di], ciImage: ciImage,
+            // Feature prints are the expensive part, so only pay for them when
+            // identity is actually at stake — or when a track is still building
+            // the appearance model it will need the moment it is.
+            let needsDescriptors = observations.count > 1
+                || tracker.isContested(at: time, observations: observations)
+                || tracker.tracks.contains {
+                    time - $0.lastConfirmedTime <= options.tracking.coastTime
+                        && $0.descriptors.count < options.descriptorTarget
+                }
+            if needsDescriptors {
+                for index in observations.indices {
+                    guard let print = await featurePrint(
+                        for: detections[index], ciImage: ciImage,
                         request: printRequest, context: ciContext
-                    )
-                    guard let probe = detections[di].print else { continue }
-                    for ci in clusters.indices where !claimedCluster.contains(ci) {
-                        let distance = clusters[ci].prints
-                            .compactMap { try? probe.distance(to: $0) }
-                            .min() ?? .greatestFiniteMagnitude
-                        if distance <= options.reidDistance {
-                            reidPairs.append((distance, ci, di))
-                        }
-                    }
-                }
-                assign(reidPairs, &claimedCluster, &claimedDetection) { ci, di in
-                    record(detections[di], at: time, index: sampleIndex, into: clusters[ci])
+                    ) else { continue }
+                    observations[index].descriptor = table.add(print)
                 }
             }
 
-            // Pass 3 — anyone still unclaimed is someone new.
-            for di in detections.indices where !claimedDetection.contains(di) {
-                await ensurePrint(
-                    &detections[di], ciImage: ciImage,
-                    request: printRequest, context: ciContext
-                )
-                let cluster = Cluster()
-                record(detections[di], at: time, index: sampleIndex, into: cluster)
-                clusters.append(cluster)
+            let claimed = tracker.update(
+                time: time, sampleIndex: sampleIndex, observations: observations
+            )
+
+            // A thumbnail should show one person, so skip crops taken while
+            // somebody was overlapping them.
+            let contested = contestedFlags(
+                detections.map(\.box), threshold: options.tracking.contactIoU
+            )
+            for index in claimed.indices where !contested[index] {
+                let detection = detections[index]
+                let score = Double(detection.confidence) * Double(detection.box.height) * 2
+                let track = claimed[index]
+                guard score > (thumbnails[track.id]?.score ?? -.greatestFiniteMagnitude),
+                      let crop = cgImage.cropping(to: detection.cgRect) else { continue }
+                thumbnails[track.id] = (crop, score)
             }
 
-            // Keep every track's appearance model fresh enough to re-identify with.
-            for ci in claimedCluster where clusters[ci].prints.count < 4 {
-                guard let di = detections.firstIndex(where: {
-                    $0.box == clusters[ci].lastBox
-                }) else { continue }
-                await ensurePrint(
-                    &detections[di], ciImage: ciImage,
-                    request: printRequest, context: ciContext
-                )
-                if let p = detections[di].print { clusters[ci].prints.append(p) }
-            }
-
-            // Thumbnails: prefer big, confident, front-facing-ish crops.
-            for cluster in clusters where cluster.lastTime == time {
-                let score = Double(cluster.sightings.last?.confidence ?? 0)
-                    * (cluster.lastBox.height * 2)
-                if score > cluster.thumbnailScore,
-                   let crop = cgImage.cropping(
-                       to: detections.first { $0.box == cluster.lastBox }?.cgRect
-                           ?? .zero
-                   ) {
-                    cluster.thumbnail = crop
-                    cluster.thumbnailScore = score
-                }
-            }
+            table.retain(Set(tracker.tracks.flatMap(\.descriptors)))
 
             onProgress(
                 Progress(
                     fraction: Double(processed) / Double(times.count),
-                    peopleFound: clusters.filter { $0.sightings.count >= options.minSightings }.count,
+                    peopleFound: tracker.tracks.filter {
+                        $0.sightings.count >= options.minSightings
+                    }.count,
                     currentTime: time
                 )
             )
@@ -239,88 +228,80 @@ nonisolated struct PersonScanner {
         try Task.checkCancellation()
         guard decodedAny else { throw ScanError.noFramesDecoded }
 
-        let merged = mergeDuplicates(clusters, options: options)
-        return finalize(merged, interval: interval, source: source, options: options)
+        let candidates = tracker.tracks
+            .filter { $0.sightings.count >= options.minSightings }
+            .map { track in
+                Candidate(
+                    id: track.id,
+                    sightings: track.sightings,
+                    descriptors: track.descriptors,
+                    sampleIndices: track.sampleIndices,
+                    thumbnail: thumbnails[track.id]?.image,
+                    thumbnailScore: thumbnails[track.id]?.score ?? -.greatestFiniteMagnitude
+                )
+            }
+
+        let merged = mergeDuplicates(candidates, table: table, options: options)
+        return finalize(merged, interval: interval, source: source)
     }
 
-    // MARK: - Clustering helpers
+    // MARK: - Vision helpers
 
-    private static func record(
-        _ detection: Detection, at time: Double, index: Int, into cluster: Cluster
-    ) {
-        cluster.sightings.append(
-            Sighting(time: time, box: detection.box, confidence: detection.confidence)
-        )
-        cluster.lastTime = time
-        cluster.lastBox = detection.box
-        cluster.times.insert(index)
-        if let p = detection.print, cluster.prints.count < 8 {
-            cluster.prints.append(p)
-        }
-    }
-
-    /// Greedy lowest-cost-first matching with one-to-one exclusivity.
-    private static func assign(
-        _ pairs: [(cost: Double, cluster: Int, detection: Int)],
-        _ claimedCluster: inout Set<Int>,
-        _ claimedDetection: inout Set<Int>,
-        _ apply: (Int, Int) -> Void
-    ) {
-        for pair in pairs.sorted(by: { $0.cost < $1.cost }) {
-            guard !claimedCluster.contains(pair.cluster),
-                  !claimedDetection.contains(pair.detection) else { continue }
-            claimedCluster.insert(pair.cluster)
-            claimedDetection.insert(pair.detection)
-            apply(pair.cluster, pair.detection)
-        }
-    }
-
-    private static func ensurePrint(
-        _ detection: inout Detection,
+    private static func featurePrint(
+        for detection: Detection,
         ciImage: CIImage,
         request: GenerateImageFeaturePrintRequest,
         context: CIContext
-    ) async {
-        guard !detection.printAttempted else { return }
-        detection.printAttempted = true
+    ) async -> FeaturePrintObservation? {
         // The head and torso carry the identity; legs are mostly background.
         var region = detection.ciRect
         region.origin.y += region.height * 0.5
         region.size.height *= 0.5
         region = region.insetBy(dx: -region.width * 0.08, dy: -region.height * 0.08)
             .intersection(ciImage.extent)
-        guard region.width > 8, region.height > 8 else { return }
+        guard region.width > 8, region.height > 8 else { return nil }
         let crop = ciImage.cropped(to: region)
             .transformed(by: CGAffineTransform(translationX: -region.minX, y: -region.minY))
-        guard let cg = context.createCGImage(
+        guard let cgImage = context.createCGImage(
             crop, from: CGRect(origin: .zero, size: region.size)
-        ) else { return }
-        detection.print = try? await request.perform(on: cg)
+        ) else { return nil }
+        return try? await request.perform(on: cgImage)
     }
+
+    // MARK: - Post-processing
 
     /// Two tracks that never share a frame and look alike are the same person
     /// walking out of shot and back in.
-    private static func mergeDuplicates(_ clusters: [Cluster], options: Options) -> [Cluster] {
-        var working = clusters.filter { $0.sightings.count >= options.minSightings }
+    private static func mergeDuplicates(
+        _ candidates: [Candidate], table: DescriptorTable, options: Options
+    ) -> [Candidate] {
+        var working = candidates
         var didMerge = true
         while didMerge {
             didMerge = false
             outer: for i in working.indices {
                 for j in working.indices where j > i {
-                    let a = working[i], b = working[j]
-                    guard a.times.isDisjoint(with: b.times) else { continue }
-                    let distance = a.prints
-                        .flatMap { pa in b.prints.compactMap { try? pa.distance(to: $0) } }
+                    guard working[i].sampleIndices.isDisjoint(with: working[j].sampleIndices)
+                    else { continue }
+                    let distance = working[i].descriptors
+                        .flatMap { a in
+                            working[j].descriptors.compactMap { table.distance(a, $0) }
+                        }
                         .min() ?? .greatestFiniteMagnitude
                     guard distance <= options.mergeDistance else { continue }
-                    a.sightings = (a.sightings + b.sightings).sorted { $0.time < $1.time }
-                    a.times.formUnion(b.times)
-                    a.prints = Array((a.prints + b.prints).prefix(8))
-                    if b.thumbnailScore > a.thumbnailScore {
-                        a.thumbnail = b.thumbnail
-                        a.thumbnailScore = b.thumbnailScore
+
+                    let absorbed = working[j]
+                    working[i].sightings = (working[i].sightings + absorbed.sightings)
+                        .sorted { $0.time < $1.time }
+                    working[i].sampleIndices.formUnion(absorbed.sampleIndices)
+                    working[i].descriptors = Array(
+                        (working[i].descriptors + absorbed.descriptors)
+                            .prefix(options.tracking.maxDescriptors)
+                    )
+                    if absorbed.thumbnailScore > working[i].thumbnailScore {
+                        working[i].thumbnail = absorbed.thumbnail
+                        working[i].thumbnailScore = absorbed.thumbnailScore
                     }
-                    a.lastTime = max(a.lastTime, b.lastTime)
                     working.remove(at: j)
                     didMerge = true
                     break outer
@@ -331,17 +312,16 @@ nonisolated struct PersonScanner {
     }
 
     private static func finalize(
-        _ clusters: [Cluster], interval: Double, source: VideoSource, options: Options
+        _ candidates: [Candidate], interval: Double, source: VideoSource
     ) -> [PersonCandidate] {
-        clusters
-            .filter { $0.sightings.count >= options.minSightings }
-            .map { cluster in
+        candidates
+            .map { candidate in
                 PersonCandidate(
-                    id: cluster.id,
+                    id: candidate.id,
                     index: 0,
-                    sightings: cluster.sightings.sorted { $0.time < $1.time },
-                    thumbnail: cluster.thumbnail,
-                    screenTime: Double(cluster.sightings.count) * interval,
+                    sightings: candidate.sightings.sorted { $0.time < $1.time },
+                    thumbnail: candidate.thumbnail,
+                    screenTime: Double(candidate.sightings.count) * interval,
                     clipDuration: source.duration
                 )
             }
@@ -356,14 +336,17 @@ nonisolated struct PersonScanner {
 
     // MARK: - Geometry
 
-    private static func iou(_ a: CGRect, _ b: CGRect) -> Double {
-        let intersection = a.intersection(b)
-        guard !intersection.isNull, intersection.width > 0, intersection.height > 0 else {
-            return 0
+    private static func contestedFlags(_ boxes: [CGRect], threshold: Double) -> [Bool] {
+        var flags = [Bool](repeating: false, count: boxes.count)
+        for i in boxes.indices {
+            for j in boxes.indices where j > i {
+                if Geometry.iou(boxes[i], boxes[j]) > threshold {
+                    flags[i] = true
+                    flags[j] = true
+                }
+            }
         }
-        let overlap = intersection.width * intersection.height
-        let union = a.width * a.height + b.width * b.height - overlap
-        return union > 0 ? overlap / union : 0
+        return flags
     }
 
     private static func pixelRect(_ normalized: CGRect, in size: CGSize) -> CGRect {
