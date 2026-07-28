@@ -28,6 +28,10 @@ struct CastView: View {
                 .padding(20)
             }
 
+            if let diagnostics = model.diagnostics {
+                DiagnosticsPanel(model: model, diagnostics: diagnostics)
+            }
+
             Divider()
 
             HStack {
@@ -64,6 +68,76 @@ struct CastView: View {
         .padding(.horizontal, 20)
         .padding(.top, 16)
         .padding(.bottom, 4)
+    }
+}
+
+/// Surfaces why the scan produced the cast it did. The near-miss list is the
+/// useful part: if one person is listed twice, they are in it, and the distance
+/// says exactly how far the threshold missed by.
+private struct DiagnosticsPanel: View {
+    @Bindable var model: AppModel
+    let diagnostics: ScanDiagnostics
+    @State private var isExpanded = false
+    @State private var didCopy = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Divider()
+            HStack(spacing: 10) {
+                Button {
+                    isExpanded.toggle()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                        Text("Scan report").font(.system(size: 11, weight: .medium))
+                    }
+                }
+                .buttonStyle(.plain)
+
+                summaryChips
+
+                Spacer()
+
+                Button {
+                    model.copyDiagnosticsToPasteboard()
+                    didCopy = true
+                } label: {
+                    Label(didCopy ? "Copied" : "Copy", systemImage: didCopy ? "checkmark" : "doc.on.doc")
+                }
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 9)
+
+            if isExpanded {
+                ScrollView {
+                    Text(diagnostics.report(people: model.candidates))
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                }
+                .frame(height: 220)
+                .background(Color.secondary.opacity(0.06))
+            }
+        }
+        .animation(.snappy(duration: 0.2), value: isExpanded)
+    }
+
+    private var summaryChips: some View {
+        HStack(spacing: 6) {
+            MetaChip(symbol: "person.2", text: "\(diagnostics.tracksCreated) tracks → \(diagnostics.finalPeopleCount)")
+            if diagnostics.mergesApplied > 0 {
+                MetaChip(symbol: "arrow.triangle.merge", text: "\(diagnostics.mergesApplied) merged")
+            }
+            if let closest = diagnostics.nearMisses.first {
+                MetaChip(
+                    symbol: "exclamationmark.triangle",
+                    text: String(format: "closest near-miss %.2f", closest.robustDistance)
+                )
+            }
+        }
     }
 }
 

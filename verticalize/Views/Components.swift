@@ -87,6 +87,8 @@ struct CropOverlay: View {
     /// Normalized to the display frame, top-left origin.
     let cropRect: CGRect
     let subjectRect: CGRect?
+    /// Every other tracked person, for diagnosing who the camera is following.
+    var otherTracks: [(label: String, rect: CGRect)] = []
 
     var body: some View {
         GeometryReader { geo in
@@ -101,6 +103,23 @@ struct CropOverlay: View {
                             .frame(width: crop.width, height: crop.height)
                             .position(x: crop.midX, y: crop.midY)
                     }
+
+                ForEach(Array(otherTracks.enumerated()), id: \.offset) { _, track in
+                    let box = scaled(track.rect, in: size)
+                    RoundedRectangle(cornerRadius: 3)
+                        .stroke(.orange.opacity(0.9), style: StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
+                        .frame(width: box.width, height: box.height)
+                        .position(x: box.midX, y: box.midY)
+                        .overlay(alignment: .topLeading) {
+                            Text(track.label)
+                                .font(.system(size: 9, weight: .bold))
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(Capsule().fill(.orange))
+                                .foregroundStyle(.black)
+                                .position(x: box.minX + 20, y: box.minY - 7)
+                        }
+                }
 
                 if let subjectRect {
                     let subject = scaled(subjectRect, in: size)

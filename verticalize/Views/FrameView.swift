@@ -39,7 +39,8 @@ struct FrameView: View {
                                 CropOverlay(
                                     cropRect: path.normalizedRect(at: model.currentTime),
                                     subjectRect: model.selectedPerson?
-                                        .sighting(nearest: model.currentTime)?.box
+                                        .sighting(nearest: model.currentTime)?.box,
+                                    otherTracks: model.showsTrackOverlay ? otherTracks : []
                                 )
                             }
                         }
@@ -60,6 +61,16 @@ struct FrameView: View {
         }
         .padding(18)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Everyone the scanner found except the subject, at the current instant.
+    private var otherTracks: [(label: String, rect: CGRect)] {
+        model.candidates.compactMap { candidate in
+            guard candidate.id != model.selectedPersonID,
+                  let sighting = candidate.sighting(nearest: model.currentTime)
+            else { return nil }
+            return (candidate.label, sighting.box)
+        }
     }
 
     private func paneTitle(_ title: String, _ detail: String) -> some View {
@@ -141,6 +152,15 @@ struct FrameView: View {
                     ) { String(format: "%+.2f", $0) }
                     .disabled(model.settings.zoom <= 1.001)
                     .opacity(model.settings.zoom <= 1.001 ? 0.45 : 1)
+                }
+
+                section("Diagnostics") {
+                    Toggle("Show all tracks", isOn: $model.showsTrackOverlay)
+                        .controlSize(.small)
+                    Text("Outlines everyone the scan found, so you can see who "
+                         + "the camera is following and when it changes its mind.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
                 }
 
                 Button("Reset to Defaults") {

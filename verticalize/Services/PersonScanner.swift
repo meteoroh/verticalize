@@ -110,11 +110,16 @@ nonisolated struct PersonScanner {
 
     // MARK: - Entry point
 
+    struct Result: @unchecked Sendable {
+        var people: [PersonCandidate]
+        var diagnostics: ScanDiagnostics
+    }
+
     static func scan(
         source: VideoSource,
         options: Options = Options(),
         onProgress: @Sendable (Progress) -> Void = { _ in }
-    ) async throws -> [PersonCandidate] {
+    ) async throws -> Result {
         let asset = AVURLAsset(url: source.url)
         guard try await !asset.loadTracks(withMediaType: .video).isEmpty else {
             throw ScanError.noVideoTrack
@@ -158,6 +163,13 @@ nonisolated struct PersonScanner {
         var processed = 0
         var decodedAny = false
 
+        var diagnostics = ScanDiagnostics()
+        diagnostics.sampleInterval = interval
+        diagnostics.requestedFrames = times.count
+        diagnostics.minSightings = minSightings
+        diagnostics.mergeThreshold = max(options.mergeDistance, options.tracking.reidDistance)
+        diagnostics.reidDistance = options.tracking.reidDistance
+
         for await element in generator.images(for: times) {
             try Task.checkCancellation()
             processed += 1
@@ -169,11 +181,22 @@ nonisolated struct PersonScanner {
             let imageSize = CGSize(width: cgImage.width, height: cgImage.height)
             let ciImage = CIImage(cgImage: cgImage)
 
+            diagnostics.decodedFrames += 1
             let humans = (try? await humanRequest.perform(on: cgImage)) ?? []
+            for human in humans {
+                let bucket = min(max(Int(human.confidence * 10), 0), 9)
+                diagnostics.confidenceBuckets[bucket] += 1
+            }
             let detections = humans.compactMap { human -> Detection? in
-                guard human.confidence >= options.minConfidence else { return nil }
+                guard human.confidence >= options.minConfidence else {
+                    diagnostics.rejectedByConfidence += 1
+                    return nil
+                }
                 let normalized = human.boundingBox.cgRect
-                guard normalized.height >= options.minBoxHeight else { return nil }
+                guard normalized.height >= options.minBoxHeight else {
+                    diagnostics.rejectedBySize += 1
+                    return nil
+                }
                 let topLeft = CGRect(
                     x: normalized.minX,
                     y: 1 - normalized.maxY,
@@ -213,9 +236,14 @@ nonisolated struct PersonScanner {
                 }
             }
 
+            diagnostics.totalDetections += detections.count
+            if detections.isEmpty { diagnostics.emptyFrames += 1 }
+            diagnostics.detectionsPerFrame[min(detections.count, 8)] += 1
+
             let claimed = tracker.update(
                 time: time, sampleIndex: sampleIndex, observations: observations
             )
+            diagnostics.contestedDetections += claimed.filter(\.isContested).count
 
             // A thumbnail should show one person, so reuse the tracker's view of
             // which crops had somebody else in them.
@@ -244,6 +272,10 @@ nonisolated struct PersonScanner {
         try Task.checkCancellation()
         guard decodedAny else { throw ScanError.noFramesDecoded }
 
+        diagnostics.tracksCreated = tracker.tracks.count
+        diagnostics.tracksBelowMinimum = tracker.tracks
+            .filter { $0.sightings.count < minSightings }.count
+
         let candidates = tracker.tracks
             .filter { $0.sightings.count >= minSightings }
             .map { track in
@@ -257,8 +289,12 @@ nonisolated struct PersonScanner {
                 )
             }
 
-        let merged = mergeDuplicates(candidates, table: table, options: options)
-        return finalize(merged, interval: interval, source: source)
+        let merged = mergeDuplicates(
+            candidates, table: table, options: options, diagnostics: &diagnostics
+        )
+        let people = finalize(merged, interval: interval, source: source)
+        diagnostics.finalPeopleCount = people.count
+        return Result(people: people, diagnostics: diagnostics)
     }
 
     // MARK: - Vision helpers
@@ -289,11 +325,13 @@ nonisolated struct PersonScanner {
     /// Two tracks that never share a frame and look alike are the same person
     /// walking out of shot and back in.
     private static func mergeDuplicates(
-        _ candidates: [Candidate], table: DescriptorTable, options: Options
+        _ candidates: [Candidate], table: DescriptorTable, options: Options,
+        diagnostics: inout ScanDiagnostics
     ) -> [Candidate] {
         var working = candidates
         // Enforce the invariant rather than trusting whoever edits the defaults.
         let threshold = max(options.mergeDistance, options.tracking.reidDistance)
+        var nearMisses: [UUID: ScanDiagnostics.NearMiss] = [:]
         var didMerge = true
         while didMerge {
             didMerge = false
@@ -301,13 +339,24 @@ nonisolated struct PersonScanner {
                 for j in working.indices where j > i {
                     guard working[i].sampleIndices.isDisjoint(with: working[j].sampleIndices)
                     else { continue }
+                    let all = working[i].descriptors.flatMap { a in
+                        working[j].descriptors.compactMap { table.distance(a, $0) }
+                    }
                     let distance = AppearanceMetric.robust(
-                        working[i].descriptors.flatMap { a in
-                            working[j].descriptors.compactMap { table.distance(a, $0) }
-                        },
-                        sampleCount: options.tracking.appearanceSampleCount
+                        all, sampleCount: options.tracking.appearanceSampleCount
                     ) ?? .greatestFiniteMagnitude
-                    guard distance <= threshold else { continue }
+                    guard distance <= threshold else {
+                        // Record it: a person listed twice is a pair in here,
+                        // and the distance says where the threshold missed.
+                        if distance.isFinite {
+                            nearMisses[working[i].id] = ScanDiagnostics.NearMiss(
+                                a: working[i].id, b: working[j].id,
+                                robustDistance: distance,
+                                nearestDistance: all.min() ?? distance
+                            )
+                        }
+                        continue
+                    }
 
                     let absorbed = working[j]
                     working[i].sightings = (working[i].sightings + absorbed.sightings)
@@ -322,11 +371,18 @@ nonisolated struct PersonScanner {
                         working[i].thumbnailScore = absorbed.thumbnailScore
                     }
                     working.remove(at: j)
+                    diagnostics.mergesApplied += 1
                     didMerge = true
                     break outer
                 }
             }
         }
+        // Only report near misses between tracks that actually survived, so the
+        // list matches the people shown in the cast grid.
+        let surviving = Set(working.map(\.id))
+        diagnostics.nearMisses = nearMisses.values
+            .filter { surviving.contains($0.a) && surviving.contains($0.b) }
+            .sorted { $0.robustDistance < $1.robustDistance }
         return working
     }
 

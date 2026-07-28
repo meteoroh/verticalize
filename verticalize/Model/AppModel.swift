@@ -3,6 +3,7 @@
 //  verticalize
 //
 
+import AppKit
 import AVFoundation
 import Observation
 import SwiftUI
@@ -42,6 +43,9 @@ final class AppModel {
     private(set) var scanPeopleFound = 0
     private(set) var scanTime: Double = 0
     private(set) var candidates: [PersonCandidate] = []
+    private(set) var diagnostics: ScanDiagnostics?
+    /// Draws every tracked person over the source, not just the subject.
+    var showsTrackOverlay = false
 
     var selectedPersonID: UUID? {
         didSet { if selectedPersonID != oldValue { rebuildPath(immediately: true) } }
@@ -134,6 +138,7 @@ final class AppModel {
         scopedURL = nil
         source = nil
         candidates = []
+        diagnostics = nil
         selectedPersonID = nil
         path = nil
         currentTime = 0
@@ -191,6 +196,7 @@ final class AppModel {
         scanPeopleFound = 0
         scanTime = 0
         candidates = []
+        diagnostics = nil
 
         scanTask = Task { [weak self] in
             do {
@@ -202,11 +208,12 @@ final class AppModel {
                     }
                 }
                 guard let self, !Task.isCancelled else { return }
-                self.candidates = found
+                self.candidates = found.people
+                self.diagnostics = found.diagnostics
                 self.isScanning = false
                 self.scanProgress = 1
                 self.stage = .cast
-                if let first = found.first {
+                if let first = found.people.first {
                     self.selectedPersonID = first.id
                 }
             } catch is CancellationError {
@@ -353,6 +360,17 @@ final class AppModel {
     }
 
     // MARK: - Navigation
+
+    /// Paste-ready scan summary, for tuning against real footage.
+    var diagnosticsReport: String? {
+        diagnostics?.report(people: candidates)
+    }
+
+    func copyDiagnosticsToPasteboard() {
+        guard let report = diagnosticsReport else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(report, forType: .string)
+    }
 
     func goBack() {
         switch stage {
