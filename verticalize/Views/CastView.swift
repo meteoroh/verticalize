@@ -131,10 +131,10 @@ private struct DiagnosticsPanel: View {
             if diagnostics.mergesApplied > 0 {
                 MetaChip(symbol: "arrow.triangle.merge", text: "\(diagnostics.mergesApplied) merged")
             }
-            if let closest = diagnostics.nearMisses.first {
+            if let closest = diagnostics.nearMisses.min(by: { $0.sortKey < $1.sortKey }) {
                 MetaChip(
                     symbol: "exclamationmark.triangle",
-                    text: String(format: "closest near-miss %.2f", closest.robustDistance)
+                    text: "closest decline: \(closest.describe)"
                 )
             }
         }

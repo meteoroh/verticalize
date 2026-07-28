@@ -40,6 +40,12 @@ nonisolated struct PersonScanner {
         /// stricter value can only ever re-reject what online matching already
         /// rejected, which is how one person ended up listed twice.
         var mergeDistance: Double = 0.80
+        /// How much two tracks may overlap in time and still be considered one
+        /// person. Sharing frames normally proves two people, but the detector
+        /// occasionally double-reports somebody, and a single such frame used
+        /// to make two halves of one track unmergeable forever. Two genuinely
+        /// different people who are both on screen overlap far more than this.
+        var mergeOverlapTolerance: Double = 0.04
         /// Tracks on screen for less than this are noise. Expressed in seconds
         /// rather than sightings so the sample rate can change independently.
         var minScreenTime: Double = 0.6
@@ -95,6 +101,15 @@ nonisolated struct PersonScanner {
 
         func retain(_ ids: Set<Int>) {
             prints = prints.filter { ids.contains($0.key) }
+        }
+    }
+
+    /// Unordered pair key, so a declined merge is reported once.
+    private struct Pair: Hashable {
+        let a: UUID
+        let b: UUID
+        init(_ x: UUID, _ y: UUID) {
+            (a, b) = x.uuidString < y.uuidString ? (x, y) : (y, x)
         }
     }
 
@@ -169,6 +184,7 @@ nonisolated struct PersonScanner {
         diagnostics.minSightings = minSightings
         diagnostics.mergeThreshold = max(options.mergeDistance, options.tracking.reidDistance)
         diagnostics.reidDistance = options.tracking.reidDistance
+        diagnostics.overlapTolerance = options.mergeOverlapTolerance
 
         for await element in generator.images(for: times) {
             try Task.checkCancellation()
@@ -331,30 +347,47 @@ nonisolated struct PersonScanner {
         var working = candidates
         // Enforce the invariant rather than trusting whoever edits the defaults.
         let threshold = max(options.mergeDistance, options.tracking.reidDistance)
-        var nearMisses: [UUID: ScanDiagnostics.NearMiss] = [:]
+        var declined: [ScanDiagnostics.NearMiss] = []
         var didMerge = true
         while didMerge {
             didMerge = false
             outer: for i in working.indices {
                 for j in working.indices where j > i {
-                    guard working[i].sampleIndices.isDisjoint(with: working[j].sampleIndices)
-                    else { continue }
+                    func decline(_ reason: ScanDiagnostics.NearMiss.Reason) {
+                        declined.append(ScanDiagnostics.NearMiss(
+                            a: working[i].id, b: working[j].id, reason: reason
+                        ))
+                    }
+
+                    // Sharing frames normally proves two people. But the
+                    // detector occasionally reports one person twice, and a
+                    // single such frame used to make two halves of one track
+                    // permanently unmergeable — so judge by how *much* they
+                    // overlap rather than whether they overlap at all.
+                    let shared = working[i].sampleIndices
+                        .intersection(working[j].sampleIndices).count
+                    let shorter = min(
+                        working[i].sampleIndices.count, working[j].sampleIndices.count
+                    )
+                    let overlap = shorter > 0 ? Double(shared) / Double(shorter) : 1
+                    guard overlap <= options.mergeOverlapTolerance else {
+                        decline(.sharedFrames(count: shared, fractionOfShorter: overlap))
+                        continue
+                    }
+
                     let all = working[i].descriptors.flatMap { a in
                         working[j].descriptors.compactMap { table.distance(a, $0) }
                     }
-                    let distance = AppearanceMetric.robust(
+                    guard let distance = AppearanceMetric.robust(
                         all, sampleCount: options.tracking.appearanceSampleCount
-                    ) ?? .greatestFiniteMagnitude
+                    ) else {
+                        decline(.noComparableDescriptors)
+                        continue
+                    }
                     guard distance <= threshold else {
-                        // Record it: a person listed twice is a pair in here,
-                        // and the distance says where the threshold missed.
-                        if distance.isFinite {
-                            nearMisses[working[i].id] = ScanDiagnostics.NearMiss(
-                                a: working[i].id, b: working[j].id,
-                                robustDistance: distance,
-                                nearestDistance: all.min() ?? distance
-                            )
-                        }
+                        decline(.tooFarApart(
+                            robust: distance, nearest: all.min() ?? distance
+                        ))
                         continue
                     }
 
@@ -377,12 +410,17 @@ nonisolated struct PersonScanner {
                 }
             }
         }
-        // Only report near misses between tracks that actually survived, so the
-        // list matches the people shown in the cast grid.
+        // Only report pairs where both sides survived, so the list matches the
+        // people shown in the cast grid. Keep the most informative reason per
+        // pair rather than one row for every retry of the loop.
         let surviving = Set(working.map(\.id))
-        diagnostics.nearMisses = nearMisses.values
-            .filter { surviving.contains($0.a) && surviving.contains($0.b) }
-            .sorted { $0.robustDistance < $1.robustDistance }
+        var best: [Pair: ScanDiagnostics.NearMiss] = [:]
+        for miss in declined where surviving.contains(miss.a) && surviving.contains(miss.b) {
+            let key = Pair(miss.a, miss.b)
+            if let existing = best[key], existing.sortKey <= miss.sortKey { continue }
+            best[key] = miss
+        }
+        diagnostics.nearMisses = Array(best.values)
         return working
     }
 

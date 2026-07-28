@@ -12,16 +12,45 @@ import Foundation
 
 nonisolated struct ScanDiagnostics: Sendable {
 
-    /// Two tracks that never shared a frame but were judged different people.
-    /// If one person is listed twice, they are in here, and their distances
-    /// say precisely where the threshold would have had to be.
+    /// A pair of tracks the merge pass declined to join. If one person is
+    /// listed twice they are in here, together with the reason — which is the
+    /// part that says what to change.
     struct NearMiss: Sendable {
+        enum Reason: Sendable {
+            /// Compared on appearance and judged different people.
+            case tooFarApart(robust: Double, nearest: Double)
+            /// One of them never learned an appearance model, so no comparison
+            /// was possible. Usually a short track born in a crowded frame.
+            case noComparableDescriptors
+            /// They appeared in the same frame, so they cannot be one person —
+            /// unless the detector double-reported somebody, which is why the
+            /// overlap is measured rather than merely tested.
+            case sharedFrames(count: Int, fractionOfShorter: Double)
+        }
+
         var a: UUID
         var b: UUID
-        /// Mean of the nearest few descriptor distances — what the merge used.
-        var robustDistance: Double
-        /// Single closest descriptor pair — what the old rule used.
-        var nearestDistance: Double
+        var reason: Reason
+
+        var sortKey: Double {
+            switch reason {
+            case .tooFarApart(let robust, _): robust
+            case .sharedFrames(_, let fraction): 10 + fraction
+            case .noComparableDescriptors: 100
+            }
+        }
+
+        var describe: String {
+            switch reason {
+            case .tooFarApart(let robust, let nearest):
+                String(format: "robust %.3f   nearest %.3f", robust, nearest)
+            case .noComparableDescriptors:
+                "no appearance model on one side"
+            case .sharedFrames(let count, let fraction):
+                String(format: "shared %d frames (%.1f%% of the shorter track)",
+                       count, fraction * 100)
+            }
+        }
     }
 
     var sampleInterval: Double = 0
@@ -49,6 +78,7 @@ nonisolated struct ScanDiagnostics: Sendable {
     var minSightings = 0
     var mergeThreshold = 0.0
     var reidDistance = 0.0
+    var overlapTolerance = 0.0
 
     var finalPeopleCount = 0
 
@@ -89,20 +119,17 @@ nonisolated struct ScanDiagnostics: Sendable {
 
         if !nearMisses.isEmpty {
             out.append("")
-            out.append("NEAR-MISS MERGES  (never co-occurred, judged different)")
+            out.append("MERGES DECLINED  (why each pair stayed two people)")
             out.append("  threshold       \(String(format: "%.2f", mergeThreshold))"
-                       + "   online re-ID \(String(format: "%.2f", reidDistance))")
-            for miss in nearMisses.prefix(12) {
-                let a = labels[miss.a] ?? "?"
-                let b = labels[miss.b] ?? "?"
-                out.append(String(
-                    format: "  %-10s %-10s robust %.3f   nearest %.3f",
-                    (a as NSString).utf8String!, (b as NSString).utf8String!,
-                    miss.robustDistance, miss.nearestDistance
-                ))
+                       + "   online re-ID \(String(format: "%.2f", reidDistance))"
+                       + "   overlap allowance \(String(format: "%.0f%%", overlapTolerance * 100))")
+            for miss in nearMisses.sorted(by: { $0.sortKey < $1.sortKey }).prefix(14) {
+                let a = (labels[miss.a] ?? "?").padding(toLength: 10, withPad: " ", startingAt: 0)
+                let b = (labels[miss.b] ?? "?").padding(toLength: 10, withPad: " ", startingAt: 0)
+                out.append("  \(a) \(b) \(miss.describe)")
             }
-            if nearMisses.count > 12 {
-                out.append("  … and \(nearMisses.count - 12) more")
+            if nearMisses.count > 14 {
+                out.append("  … and \(nearMisses.count - 14) more")
             }
         }
 
@@ -110,10 +137,10 @@ nonisolated struct ScanDiagnostics: Sendable {
             out.append("")
             out.append("PEOPLE")
             for person in people {
+                let label = person.label.padding(toLength: 10, withPad: " ", startingAt: 0)
                 out.append(String(
-                    format: "  %-10s %5.1fs on screen  %3d sightings  %d gap(s)  %@",
-                    (person.label as NSString).utf8String!,
-                    person.screenTime, person.sightings.count,
+                    format: "  %@ %5.1fs on screen  %4d sightings  %2d gap(s)  %@",
+                    label, person.screenTime, person.sightings.count,
                     person.absenceCount(threshold: sampleInterval * 3),
                     "\(VideoSource.timecode(person.firstSeen))–\(VideoSource.timecode(person.lastSeen))"
                 ))

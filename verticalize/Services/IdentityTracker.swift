@@ -94,6 +94,9 @@ nonisolated final class IdentityTracker {
         /// being occluded — and will walk back in at an edge, not materialise
         /// in the middle of the frame.
         fileprivate(set) var leftAtSideEdge = false
+        /// Whether `descriptors` holds crops known to contain one person, or a
+        /// provisional stand-in taken from a contested frame.
+        fileprivate(set) var hasCleanDescriptor = false
         fileprivate var descriptorCursor = 0
 
         fileprivate func predictedBox(at time: Double, options: Options) -> CGRect {
@@ -349,10 +352,23 @@ nonisolated final class IdentityTracker {
             Sighting(time: time, box: observation.box, confidence: observation.confidence)
         )
 
-        // Only learn an identity from a crop that contains one person.
-        guard !contested,
-              observation.confidence >= options.minCleanConfidence,
-              let descriptor = observation.descriptor else { return }
+        guard let descriptor = observation.descriptor else { return }
+        let isClean = !contested && observation.confidence >= options.minCleanConfidence
+
+        // Prefer to learn identity only from a crop containing one person. But
+        // a track with no model at all can never be re-identified or merged —
+        // a short track born in a crowded frame would be stranded as its own
+        // person forever — so take a contested crop rather than nothing, and
+        // discard it the moment something clean arrives.
+        guard isClean || track.descriptors.isEmpty else { return }
+        if isClean, !track.hasCleanDescriptor {
+            track.descriptors.removeAll()
+            track.hasCleanDescriptor = true
+            track.descriptorCursor = 0
+        } else if !isClean, track.hasCleanDescriptor {
+            return
+        }
+
         if track.descriptors.count < options.maxDescriptors {
             track.descriptors.append(descriptor)
         } else {
