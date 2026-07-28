@@ -70,8 +70,9 @@ Or from the command line:
 xcodebuild -project verticalize.xcodeproj -scheme verticalize -configuration Release build
 ```
 
-The project has a `DEVELOPMENT_TEAM` set for local signing. If you're building this
-yourself, change it to your own team in the target's Signing & Capabilities.
+No `DEVELOPMENT_TEAM` is set, so a fresh clone builds and runs straight away under
+"Sign to Run Locally" — the app is sandboxed, but ad-hoc signing satisfies that for local
+use. Set your own team in Signing & Capabilities only if you want to distribute a build.
 
 ## Known limitations
 
