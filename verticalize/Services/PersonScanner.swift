@@ -30,8 +30,16 @@ nonisolated struct PersonScanner {
         var minConfidence: Float = 0.35
         /// Boxes smaller than this fraction of the frame height are noise.
         var minBoxHeight: Double = 0.06
-        /// Looser threshold used when merging tracks that never co-occur.
-        var mergeDistance: Double = 0.55
+        /// Threshold for merging tracks that never co-occur.
+        ///
+        /// This must be at least as permissive as the tracker's `reidDistance`.
+        /// The whole point of this pass is to catch re-entries that online
+        /// re-identification missed, and it has strictly more evidence to work
+        /// with: the two tracks provably never share a frame, both have their
+        /// full descriptor sets, and nothing is competing for the match. A
+        /// stricter value can only ever re-reject what online matching already
+        /// rejected, which is how one person ended up listed twice.
+        var mergeDistance: Double = 0.80
         /// Tracks on screen for less than this are noise. Expressed in seconds
         /// rather than sightings so the sample rate can change independently.
         var minScreenTime: Double = 0.6
@@ -284,6 +292,8 @@ nonisolated struct PersonScanner {
         _ candidates: [Candidate], table: DescriptorTable, options: Options
     ) -> [Candidate] {
         var working = candidates
+        // Enforce the invariant rather than trusting whoever edits the defaults.
+        let threshold = max(options.mergeDistance, options.tracking.reidDistance)
         var didMerge = true
         while didMerge {
             didMerge = false
@@ -291,12 +301,13 @@ nonisolated struct PersonScanner {
                 for j in working.indices where j > i {
                     guard working[i].sampleIndices.isDisjoint(with: working[j].sampleIndices)
                     else { continue }
-                    let distance = working[i].descriptors
-                        .flatMap { a in
+                    let distance = AppearanceMetric.robust(
+                        working[i].descriptors.flatMap { a in
                             working[j].descriptors.compactMap { table.distance(a, $0) }
-                        }
-                        .min() ?? .greatestFiniteMagnitude
-                    guard distance <= options.mergeDistance else { continue }
+                        },
+                        sampleCount: options.tracking.appearanceSampleCount
+                    ) ?? .greatestFiniteMagnitude
+                    guard distance <= threshold else { continue }
 
                     let absorbed = working[j]
                     working[i].sightings = (working[i].sightings + absorbed.sightings)

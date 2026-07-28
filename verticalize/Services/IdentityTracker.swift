@@ -32,6 +32,20 @@ nonisolated final class IdentityTracker {
         var appearanceCeiling: Double = 1.05
         /// Appearance-only re-identification threshold.
         var reidDistance: Double = 0.62
+        /// How many of a track's nearest descriptors are averaged to compare it
+        /// with a detection. Comparing against the single nearest lets one
+        /// lucky match pull in a stranger, and one unlucky set lose the real
+        /// subject; averaging the closest few tightens both tails at once.
+        var appearanceSampleCount: Int = 3
+        /// A box within this fraction of the left or right edge counts as
+        /// touching it. Top and bottom are deliberately excluded — a standing
+        /// subject's box reaches the bottom of frame almost always.
+        var frameEdgeMargin: Double = 0.05
+        /// Require a re-identification to be the best match in both directions.
+        /// An ambiguous re-entry then starts a new track instead of guessing,
+        /// and the scanner's offline merge — which knows the two tracks never
+        /// share a frame — resolves it with more evidence than exists here.
+        var requireMutualBestReid: Bool = true
         /// Two boxes overlapping more than this make a frame ambiguous, and any
         /// crop taken from it unfit to learn an identity from.
         var contactIoU: Double = 0.12
@@ -75,6 +89,11 @@ nonisolated final class IdentityTracker {
         fileprivate(set) var descriptors: [Int] = []
         /// Sample indices this track was seen at, for the co-occurrence check.
         fileprivate(set) var sampleIndices: Set<Int> = []
+        /// Whether the last confirmed box was against the left or right edge.
+        /// If it was, this person most likely walked out of shot rather than
+        /// being occluded — and will walk back in at an edge, not materialise
+        /// in the middle of the frame.
+        fileprivate(set) var leftAtSideEdge = false
         fileprivate var descriptorCursor = 0
 
         fileprivate func predictedBox(at time: Double, options: Options) -> CGRect {
@@ -146,6 +165,13 @@ nonisolated final class IdentityTracker {
             .map { predictions[$0] }
         let contested = contestedFlags(observations, predictions: livePredictions)
 
+        // Appearance is needed twice — once for the cost and once to decide
+        // mutual-best — so compute the whole matrix up front.
+        let appearances = tracks.map { track in
+            observations.map { appearanceDistance(track: track, observation: $0) }
+        }
+        let mutualBest = mutualBestPairs(appearances, observationCount: observations.count)
+
         var costs = [[Double]](
             repeating: [Double](repeating: Self.forbidden, count: observations.count),
             count: tracks.count
@@ -154,7 +180,9 @@ nonisolated final class IdentityTracker {
             for o in observations.indices {
                 costs[t][o] = cost(
                     track: tracks[t], predicted: predictions[t],
-                    observation: observations[o], time: time, ambiguous: ambiguous
+                    observation: observations[o], appearance: appearances[t][o],
+                    isMutualBest: mutualBest.contains(Pair(track: t, observation: o)),
+                    time: time, ambiguous: ambiguous
                 )
             }
         }
@@ -200,10 +228,8 @@ nonisolated final class IdentityTracker {
 
     private func cost(
         track: Track, predicted: CGRect, observation: Observation,
-        time: Double, ambiguous: Bool
+        appearance: Double?, isMutualBest: Bool, time: Double, ambiguous: Bool
     ) -> Double {
-        let appearance = appearanceDistance(track: track, observation: observation)
-
         // A hard veto: no overlap, however perfect, outranks looking like
         // somebody else. This is what stops a swap at a crossing.
         if let appearance, appearance > options.appearanceCeiling {
@@ -214,10 +240,20 @@ nonisolated final class IdentityTracker {
         let motionSupported = time - track.lastConfirmedTime <= options.motionGap
             && overlap >= options.minIoU
 
-        // With no motion support the only evidence is appearance, so it has to
-        // be convincing on its own before the pair is even considered.
+        // Re-identification: motion says nothing, so every other check applies.
         if !motionSupported {
+            // Appearance has to be convincing on its own…
             guard let appearance, appearance <= options.reidDistance else {
+                return Self.forbidden
+            }
+            // …and unambiguous. A contested re-entry is better left to start a
+            // new track, which the offline merge can join up later.
+            if options.requireMutualBestReid, !isMutualBest {
+                return Self.forbidden
+            }
+            // Somebody who walked out of the side of frame walks back in at a
+            // side. A detection appearing mid-frame is a different person.
+            if track.leftAtSideEdge, !touchesSideEdge(observation.box) {
                 return Self.forbidden
             }
         }
@@ -241,7 +277,44 @@ nonisolated final class IdentityTracker {
         guard let probe = observation.descriptor, !track.descriptors.isEmpty else {
             return nil
         }
-        return track.descriptors.compactMap { appearanceDistance(probe, $0) }.min()
+        return AppearanceMetric.robust(
+            track.descriptors.compactMap { appearanceDistance(probe, $0) },
+            sampleCount: options.appearanceSampleCount
+        )
+    }
+
+    /// Pairs that are each other's closest appearance match.
+    private struct Pair: Hashable {
+        var track: Int
+        var observation: Int
+    }
+
+    private func mutualBestPairs(
+        _ appearances: [[Double?]], observationCount: Int
+    ) -> Set<Pair> {
+        func argmin(_ values: [Double?]) -> Int? {
+            var best: (index: Int, value: Double)?
+            for (index, value) in values.enumerated() {
+                guard let value else { continue }
+                if best == nil || value < best!.value { best = (index, value) }
+            }
+            return best?.index
+        }
+        let bestObservation = appearances.map(argmin)
+        let bestTrack = (0..<observationCount).map { o in
+            argmin(appearances.map { $0[o] })
+        }
+        var pairs: Set<Pair> = []
+        for t in appearances.indices {
+            guard let o = bestObservation[t], bestTrack[o] == t else { continue }
+            pairs.insert(Pair(track: t, observation: o))
+        }
+        return pairs
+    }
+
+    private func touchesSideEdge(_ box: CGRect) -> Bool {
+        Double(box.minX) <= options.frameEdgeMargin
+            || Double(box.maxX) >= 1 - options.frameEdgeMargin
     }
 
     // MARK: - Track updates
@@ -270,6 +343,7 @@ nonisolated final class IdentityTracker {
 
         track.box = observation.box
         track.lastConfirmedTime = time
+        track.leftAtSideEdge = touchesSideEdge(observation.box)
         track.sampleIndices.insert(sampleIndex)
         track.sightings.append(
             Sighting(time: time, box: observation.box, confidence: observation.confidence)
@@ -321,6 +395,23 @@ nonisolated final class IdentityTracker {
             }
         }
         return false
+    }
+}
+
+// MARK: - Appearance
+
+nonisolated enum AppearanceMetric {
+    /// Mean of the `sampleCount` smallest distances.
+    ///
+    /// Taking the raw minimum makes a comparison only as reliable as its single
+    /// luckiest descriptor: one crop that happens to resemble a stranger pulls
+    /// them in, and one unrepresentative set loses the real subject. Averaging
+    /// the nearest few costs nothing and tightens both tails.
+    static func robust(_ distances: [Double], sampleCount: Int) -> Double? {
+        guard !distances.isEmpty else { return nil }
+        let sorted = distances.sorted()
+        let count = min(max(sampleCount, 1), sorted.count)
+        return sorted.prefix(count).reduce(0, +) / Double(count)
     }
 }
 
