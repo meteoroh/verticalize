@@ -17,8 +17,13 @@ import Vision
 nonisolated struct PersonScanner {
 
     struct Options: Sendable {
-        /// Frames analysed per second of footage.
-        var samplesPerSecond: Double = 5
+        /// Frames analysed per second of footage. Association quality depends
+        /// on this more than on anything else: the further a person can travel
+        /// between two samples, the less motion can say about who they are.
+        var samplesPerSecond: Double = 12
+        /// Ceiling on analysed frames, so a very long clip quietly lowers its
+        /// sample rate instead of scanning for an hour.
+        var maxSamples: Int = 9_000
         /// Longest edge handed to Vision. Smaller is faster, and detection
         /// quality plateaus well before full resolution.
         var analysisMaxEdge: Double = 1280
@@ -27,8 +32,9 @@ nonisolated struct PersonScanner {
         var minBoxHeight: Double = 0.06
         /// Looser threshold used when merging tracks that never co-occur.
         var mergeDistance: Double = 0.55
-        /// Tracks seen fewer times than this are discarded.
-        var minSightings: Int = 3
+        /// Tracks on screen for less than this are noise. Expressed in seconds
+        /// rather than sightings so the sample rate can change independently.
+        var minScreenTime: Double = 0.6
         /// Keep an appearance model this big for each track, so re-acquisition
         /// after an occlusion has several angles to compare against.
         var descriptorTarget: Int = 3
@@ -106,8 +112,13 @@ nonisolated struct PersonScanner {
             throw ScanError.noVideoTrack
         }
 
-        let interval = 1.0 / max(options.samplesPerSecond, 0.5)
+        // Honour the requested rate unless it would blow the frame budget.
+        let interval = max(
+            1.0 / max(options.samplesPerSecond, 0.5),
+            source.duration / Double(max(options.maxSamples, 1))
+        )
         let sampleCount = max(Int((source.duration / interval).rounded(.down)), 1)
+        let minSightings = max(Int((options.minScreenTime / interval).rounded()), 2)
         let times = (0..<sampleCount).map {
             CMTime(seconds: Double($0) * interval, preferredTimescale: 600)
         }
@@ -198,15 +209,12 @@ nonisolated struct PersonScanner {
                 time: time, sampleIndex: sampleIndex, observations: observations
             )
 
-            // A thumbnail should show one person, so skip crops taken while
-            // somebody was overlapping them.
-            let contested = contestedFlags(
-                detections.map(\.box), threshold: options.tracking.contactIoU
-            )
-            for index in claimed.indices where !contested[index] {
+            // A thumbnail should show one person, so reuse the tracker's view of
+            // which crops had somebody else in them.
+            for index in claimed.indices where !claimed[index].isContested {
                 let detection = detections[index]
                 let score = Double(detection.confidence) * Double(detection.box.height) * 2
-                let track = claimed[index]
+                let track = claimed[index].track
                 guard score > (thumbnails[track.id]?.score ?? -.greatestFiniteMagnitude),
                       let crop = cgImage.cropping(to: detection.cgRect) else { continue }
                 thumbnails[track.id] = (crop, score)
@@ -218,7 +226,7 @@ nonisolated struct PersonScanner {
                 Progress(
                     fraction: Double(processed) / Double(times.count),
                     peopleFound: tracker.tracks.filter {
-                        $0.sightings.count >= options.minSightings
+                        $0.sightings.count >= minSightings
                     }.count,
                     currentTime: time
                 )
@@ -229,7 +237,7 @@ nonisolated struct PersonScanner {
         guard decodedAny else { throw ScanError.noFramesDecoded }
 
         let candidates = tracker.tracks
-            .filter { $0.sightings.count >= options.minSightings }
+            .filter { $0.sightings.count >= minSightings }
             .map { track in
                 Candidate(
                     id: track.id,
@@ -335,19 +343,6 @@ nonisolated struct PersonScanner {
     }
 
     // MARK: - Geometry
-
-    private static func contestedFlags(_ boxes: [CGRect], threshold: Double) -> [Bool] {
-        var flags = [Bool](repeating: false, count: boxes.count)
-        for i in boxes.indices {
-            for j in boxes.indices where j > i {
-                if Geometry.iou(boxes[i], boxes[j]) > threshold {
-                    flags[i] = true
-                    flags[j] = true
-                }
-            }
-        }
-        return flags
-    }
 
     private static func pixelRect(_ normalized: CGRect, in size: CGSize) -> CGRect {
         CGRect(

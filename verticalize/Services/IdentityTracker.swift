@@ -37,8 +37,11 @@ nonisolated final class IdentityTracker {
         var contactIoU: Double = 0.12
         var minCleanConfidence: Float = 0.5
         var maxDescriptors: Int = 12
-        /// Velocity is an EMA; this is the weight of the newest measurement.
-        var velocityBlend: Double = 0.5
+        /// Time constant of the velocity estimate. Expressed in seconds rather
+        /// than as a fixed blend weight so that sampling more often smooths the
+        /// estimate instead of making it noisier — dividing a smaller step by a
+        /// smaller dt amplifies detector jitter.
+        var velocitySmoothing: Double = 0.25
         /// Prediction decays over a gap rather than extrapolating off-screen.
         var velocityHalfLife: Double = 0.45
 
@@ -62,7 +65,9 @@ nonisolated final class IdentityTracker {
     final class Track {
         let id = UUID()
         fileprivate(set) var sightings: [Sighting] = []
-        /// Last confirmed or coasted position.
+        /// Last *confirmed* position. Never advanced by coasting: predictions
+        /// always extrapolate from here, so a long occlusion decays to a
+        /// bounded offset instead of walking the box off across the frame.
         fileprivate(set) var box: CGRect = .zero
         fileprivate(set) var velocity: CGVector = .zero
         fileprivate(set) var lastConfirmedTime: Double = -.greatestFiniteMagnitude
@@ -120,15 +125,26 @@ nonisolated final class IdentityTracker {
         return false
     }
 
+    /// What happened to one observation this frame.
+    struct Assignment {
+        var track: Track
+        /// Whether this detection is likely to contain more than one person,
+        /// and so is unfit to learn an identity — or pick a thumbnail — from.
+        var isContested: Bool
+    }
+
     /// Advances every track by one frame.
     /// - Returns: for each observation, the track that claimed it.
     @discardableResult
     func update(
         time: Double, sampleIndex: Int, observations: [Observation]
-    ) -> [Track] {
+    ) -> [Assignment] {
         let ambiguous = isContested(at: time, observations: observations)
         let predictions = tracks.map { $0.predictedBox(at: time, options: options) }
-        let contested = contestedFlags(observations)
+        let livePredictions = tracks.indices
+            .filter { time - tracks[$0].lastConfirmedTime <= options.coastTime }
+            .map { predictions[$0] }
+        let contested = contestedFlags(observations, predictions: livePredictions)
 
         var costs = [[Double]](
             repeating: [Double](repeating: Self.forbidden, count: observations.count),
@@ -160,13 +176,9 @@ nonisolated final class IdentityTracker {
             )
         }
 
-        // Unmatched but recent tracks coast on their prediction. They keep their
-        // position for the next frame's gating without inventing a sighting.
-        for t in tracks.indices where !matchedTracks.contains(t) {
-            let track = tracks[t]
-            guard time - track.lastConfirmedTime <= options.coastTime else { continue }
-            track.box = predictions[t]
-        }
+        // Unmatched tracks are left exactly as they were. `predictedBox` always
+        // extrapolates from the last *confirmed* position, so an unmatched track
+        // needs no bookkeeping — and crucially cannot accumulate drift.
 
         // Whatever is left is somebody new.
         for o in observations.indices where claimedBy[o] == nil {
@@ -179,7 +191,9 @@ nonisolated final class IdentityTracker {
             )
         }
 
-        return claimedBy.map { $0! }
+        return claimedBy.enumerated().map {
+            Assignment(track: $0.element!, isContested: contested[$0.offset])
+        }
     }
 
     // MARK: - Cost
@@ -197,21 +211,28 @@ nonisolated final class IdentityTracker {
         }
 
         let overlap = Geometry.iou(predicted, observation.box)
-        if time - track.lastConfirmedTime <= options.motionGap, overlap >= options.minIoU {
-            let motion = 1 - overlap
-            guard let appearance else { return motion }
-            let weight = ambiguous
-                ? options.appearanceWeightAmbiguous : options.appearanceWeightClean
-            let normalized = min(appearance / options.appearanceCeiling, 1)
-            return (1 - weight) * motion + weight * normalized
+        let motionSupported = time - track.lastConfirmedTime <= options.motionGap
+            && overlap >= options.minIoU
+
+        // With no motion support the only evidence is appearance, so it has to
+        // be convincing on its own before the pair is even considered.
+        if !motionSupported {
+            guard let appearance, appearance <= options.reidDistance else {
+                return Self.forbidden
+            }
         }
 
-        // Re-identification. Always ranked below any motion-supported match, so
-        // a track that is still visibly moving is never poached by a stale one.
-        if let appearance, appearance <= options.reidDistance {
-            return 1 + appearance
-        }
-        return Self.forbidden
+        // Motion cost saturates at 1 when there is no usable overlap, which puts
+        // a re-identification on the same scale as a weak motion match rather
+        // than behind every motion match however wrong that match looks. Ranking
+        // re-ID strictly last is what let a coasting track get shoved onto the
+        // wrong person the moment an occlusion cleared.
+        let motion = motionSupported ? 1 - overlap : 1
+        guard let appearance else { return motion }
+        let weight = ambiguous
+            ? options.appearanceWeightAmbiguous : options.appearanceWeightClean
+        let normalized = min(appearance / options.appearanceCeiling, 1)
+        return (1 - weight) * motion + weight * normalized
     }
 
     private func appearanceDistance(
@@ -238,7 +259,7 @@ nonisolated final class IdentityTracker {
                 dx: (center.x - previousCenter.x) / dt,
                 dy: (center.y - previousCenter.y) / dt
             )
-            let blend = options.velocityBlend
+            let blend = 1 - exp(-dt / options.velocitySmoothing)
             track.velocity = CGVector(
                 dx: track.velocity.dx * (1 - blend) + measured.dx * blend,
                 dy: track.velocity.dy * (1 - blend) + measured.dy * blend
@@ -270,7 +291,9 @@ nonisolated final class IdentityTracker {
 
     // MARK: - Contact
 
-    private func contestedFlags(_ observations: [Observation]) -> [Bool] {
+    private func contestedFlags(
+        _ observations: [Observation], predictions: [CGRect]
+    ) -> [Bool] {
         var flags = [Bool](repeating: false, count: observations.count)
         for i in observations.indices {
             for j in observations.indices where j > i {
@@ -279,6 +302,14 @@ nonisolated final class IdentityTracker {
                     flags[j] = true
                 }
             }
+            // A single detection that more than one track is reaching for is
+            // usually two people merged into one box. It looks uncontested from
+            // the detections alone, which is how it used to poison the model of
+            // whichever track happened to claim it.
+            let claimants = predictions.filter {
+                Geometry.iou($0, observations[i].box) >= options.minIoU
+            }
+            if claimants.count > 1 { flags[i] = true }
         }
         return flags
     }
