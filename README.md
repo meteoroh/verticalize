@@ -54,6 +54,10 @@ re-encoded to AAC.
 | Zoom | 1.0× uses the full source height |
 | Vertical bias | Nudges the subject up or down in frame when zoomed in |
 
+The transport bar also carries playback speed (0.25×–2×, pitch-corrected) and
+volume. Both affect the preview only — the export always renders at the source's
+own timing and audio level.
+
 ## Requirements
 
 macOS 26.5+, Xcode 26+.

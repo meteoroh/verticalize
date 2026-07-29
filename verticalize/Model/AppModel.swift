@@ -59,6 +59,22 @@ final class AppModel {
     private(set) var currentTime: Double = 0
     private(set) var isPlaying = false
 
+    /// Preview volume. Export is unaffected — the source audio is copied
+    /// through at its original level.
+    var volume: Double = 1.0 {
+        didSet { player.volume = Float(min(max(volume, 0), 1)) }
+    }
+    var isMuted = false {
+        didSet { player.isMuted = isMuted }
+    }
+    /// Preview playback rate. Also preview-only: the export always renders at
+    /// the source's own timing.
+    var playbackRate: Double = 1.0 {
+        didSet { if isPlaying { applyRate() } }
+    }
+
+    static let playbackRates: [Double] = [0.25, 0.5, 1.0, 1.5, 2.0]
+
     private(set) var isExporting = false
     private(set) var exportProgress: Double = 0
     private(set) var lastExportURL: URL?
@@ -150,15 +166,20 @@ final class AppModel {
         exportProgress = 0
         lastExportURL = nil
         settings = .default
+        playbackRate = 1.0
         stage = .importVideo
     }
 
     private func preparePlayers(for source: VideoSource) {
         let asset = AVURLAsset(url: source.url)
         let item = AVPlayerItem(asset: asset)
+        // Keeps voices intelligible at 0.5x and 2x instead of chipmunking them.
+        item.audioTimePitchAlgorithm = .spectral
         playerItem = item
         player.replaceCurrentItem(with: item)
         player.actionAtItemEnd = .pause
+        player.volume = Float(volume)
+        player.isMuted = isMuted
         sourcePlayer.replaceCurrentItem(with: AVPlayerItem(asset: asset))
         sourcePlayer.actionAtItemEnd = .pause
         sourcePlayer.isMuted = true
@@ -287,8 +308,7 @@ final class AppModel {
             toleranceBefore: CMTime(value: 1, timescale: 30),
             toleranceAfter: CMTime(value: 1, timescale: 30)
         )
-        player.play()
-        sourcePlayer.play()
+        applyRate()
         isPlaying = true
     }
 
@@ -296,6 +316,14 @@ final class AppModel {
         player.pause()
         sourcePlayer.pause()
         isPlaying = false
+    }
+
+    /// Setting `rate` is what starts playback at a speed; `play()` would reset
+    /// it to 1. Both players move together so the two panes stay in step.
+    private func applyRate() {
+        let rate = Float(playbackRate)
+        player.rate = rate
+        sourcePlayer.rate = rate
     }
 
     func seek(to seconds: Double) {

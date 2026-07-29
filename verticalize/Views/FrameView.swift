@@ -246,6 +246,13 @@ struct FrameView: View {
                 .foregroundStyle(.tertiary)
                 .frame(width: 46, alignment: .leading)
 
+            Divider().frame(height: 15)
+
+            speedControl
+            volumeControl
+
+            Divider().frame(height: 15)
+
             Button {
                 isExportPresented = true
             } label: {
@@ -257,6 +264,57 @@ struct FrameView: View {
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 11)
+    }
+
+    private var speedControl: some View {
+        Picker("", selection: $model.playbackRate) {
+            ForEach(AppModel.playbackRates, id: \.self) { rate in
+                Text(Self.rateLabel(rate)).tag(rate)
+            }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .fixedSize()
+        .controlSize(.small)
+        .help("Preview speed. The export always renders at normal speed.")
+    }
+
+    @ViewBuilder
+    private var volumeControl: some View {
+        let hasAudio = model.source?.hasAudio ?? false
+        HStack(spacing: 5) {
+            Button {
+                model.isMuted.toggle()
+            } label: {
+                Image(systemName: volumeSymbol)
+                    .font(.system(size: 11))
+                    .frame(width: 15)
+                    .contentTransition(.symbolEffect(.replace))
+            }
+            .buttonStyle(.borderless)
+
+            Slider(value: $model.volume, in: 0...1)
+                .controlSize(.mini)
+                .frame(width: 64)
+                .disabled(model.isMuted)
+        }
+        .disabled(!hasAudio)
+        .opacity(hasAudio ? 1 : 0.35)
+        .help(hasAudio
+              ? "Preview volume. The export keeps the source audio at its own level."
+              : "This clip has no audio track.")
+        .animation(.snappy(duration: 0.15), value: model.isMuted)
+    }
+
+    private var volumeSymbol: String {
+        if model.isMuted || model.volume < 0.01 { return "speaker.slash.fill" }
+        if model.volume < 0.34 { return "speaker.wave.1.fill" }
+        if model.volume < 0.67 { return "speaker.wave.2.fill" }
+        return "speaker.wave.3.fill"
+    }
+
+    private static func rateLabel(_ rate: Double) -> String {
+        String(format: "%g×", rate)
     }
 
     /// Tick marks where the subject enters or leaves frame.
