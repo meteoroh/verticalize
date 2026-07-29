@@ -29,9 +29,30 @@ nonisolated final class IdentityTracker {
         /// …and when it does, which is when identities actually get confused.
         var appearanceWeightAmbiguous: Double = 0.8
         /// No amount of overlap can justify a match beyond this far apart.
-        var appearanceCeiling: Double = 1.05
+        ///
+        /// Calibrated against measured full-body FeaturePrint distances on real
+        /// footage: same person p99 = 0.63 (wider after a long gap), different
+        /// people p50 = 0.48. The previous 1.05 sat above almost every distance
+        /// either class produces, so the "hard veto" vetoed essentially nothing
+        /// — and because the cost function normalises by this value, it also
+        /// squashed the appearance term into a fraction of its range, muting it
+        /// even at full weight. This sits above nearly every true match while
+        /// still rejecting the clearest strangers.
+        var appearanceCeiling: Double = 0.85
         /// Appearance-only re-identification threshold.
-        var reidDistance: Double = 0.62
+        ///
+        /// Calibrated against the distances that *matter here*: re-identification
+        /// only happens after a gap, and measured same-person distances widen
+        /// sharply with time apart (p90 rises 0.300 → 0.439 → 0.493 across
+        /// <0.5s, 0.5-2s and 2-10s). Tuning to the all-pairs optimum of 0.345 —
+        /// a figure dominated by easy adjacent-frame pairs — rejected most
+        /// genuine re-entries and fragmented tracks badly.
+        ///
+        /// Different people sit at p50 0.476, so this threshold necessarily
+        /// admits some strangers. Mutual-best matching and the frame-edge gate
+        /// are what make that survivable; appearance alone cannot separate
+        /// these two populations, which is the case for a real ReID model.
+        var reidDistance: Double = 0.50
         /// How many of a track's nearest descriptors are averaged to compare it
         /// with a detection. Comparing against the single nearest lets one
         /// lucky match pull in a stranger, and one unlucky set lose the real

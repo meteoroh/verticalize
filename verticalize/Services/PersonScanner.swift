@@ -39,7 +39,17 @@ nonisolated struct PersonScanner {
         /// full descriptor sets, and nothing is competing for the match. A
         /// stricter value can only ever re-reject what online matching already
         /// rejected, which is how one person ended up listed twice.
-        var mergeDistance: Double = 0.80
+        ///
+        /// It can afford to sit well above `reidDistance` because proven
+        /// non-co-occurrence already excludes most strangers — but not
+        /// arbitrarily far above it. Measured different-person distances have a
+        /// median of 0.48, so the previous 0.80 amounted to "merge anything
+        /// that never shares a frame", which happened to give the right answer
+        /// on one clip and would merge two genuinely different people who
+        /// simply never appear together. This sits above the same-person p90
+        /// for long gaps (0.49) so real re-entries rejoin, without reaching
+        /// the point of merging on no evidence at all.
+        var mergeDistance: Double = 0.65
         /// How much two tracks may overlap in time and still be considered one
         /// person. Sharing frames normally proves two people, but the detector
         /// occasionally double-reports somebody, and a single such frame used
@@ -48,7 +58,9 @@ nonisolated struct PersonScanner {
         var mergeOverlapTolerance: Double = 0.04
         /// Tracks on screen for less than this are noise. Expressed in seconds
         /// rather than sightings so the sample rate can change independently.
-        var minScreenTime: Double = 0.6
+        /// Nobody picks a subject who appears for a second, and short fragments
+        /// are exactly what survives when re-identification fails.
+        var minScreenTime: Double = 2.0
         /// Keep an appearance model this big for each track, so re-acquisition
         /// after an occlusion has several angles to compare against.
         var descriptorTarget: Int = 3
@@ -321,11 +333,14 @@ nonisolated struct PersonScanner {
         request: GenerateImageFeaturePrintRequest,
         context: CIContext
     ) async -> FeaturePrintObservation? {
-        // The head and torso carry the identity; legs are mostly background.
-        var region = detection.ciRect
-        region.origin.y += region.height * 0.5
-        region.size.height *= 0.5
-        region = region.insetBy(dx: -region.width * 0.08, dy: -region.height * 0.08)
+        // Measured on real footage, the whole person separates identities better
+        // than the head-and-torso crop this used to take: AUC 0.900 vs 0.893,
+        // and the overlap between same-person and different-person distances
+        // narrows from 0.115 to 0.097. It is also the shape a dedicated ReID
+        // model would expect, should one ever replace FeaturePrint.
+        let region = detection.ciRect
+            .insetBy(dx: -detection.ciRect.width * 0.08,
+                     dy: -detection.ciRect.height * 0.08)
             .intersection(ciImage.extent)
         guard region.width > 8, region.height > 8 else { return nil }
         let crop = ciImage.cropped(to: region)
