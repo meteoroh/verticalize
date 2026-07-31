@@ -86,8 +86,9 @@ use. Set your own team in Signing & Capabilities only if you want to distribute 
   for person re-identification, so two people dressed alike can still be confused. A
   dedicated ReID Core ML model is the biggest available quality lever.
 - **Automated tests use synthetic input.** The tracking, geometry, and export layers are
-  covered by scripted scenarios with known ground truth. Vision's detector and feature
-  prints themselves are exercised only by running the app on real footage.
+  covered by scripted scenarios with known ground truth (`xcodebuild test`, or ⌘U).
+  Vision's detector and feature prints themselves are exercised only by running the app
+  on real footage.
 
 ## Tuning
 

@@ -92,7 +92,11 @@ nonisolated struct ScanDiagnostics: Sendable {
 
         out.append("")
         out.append("SAMPLING")
-        out.append("  rate            \(String(format: "%.1f", 1 / max(sampleInterval, .leastNonzeroMagnitude))) fps"
+        // Guarding with leastNonzeroMagnitude used to overflow the reciprocal to
+        // infinity and print "inf fps" — the same class of sentinel leak that
+        // once hid a real finding behind a 309-digit number.
+        let rate = sampleInterval > 0 ? String(format: "%.1f", 1 / sampleInterval) : "—"
+        out.append("  rate            \(rate) fps"
                    + "  (\(decodedFrames)/\(requestedFrames) frames decoded)")
 
         out.append("")
